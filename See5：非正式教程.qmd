@@ -1,0 +1,243 @@
+---
+title: "See5：非正式教程"
+format: html
+editor: visual
+source: https://www.rulequest.com/see5-win.html#CASEWEIGHT
+execute: 
+  echo: false
+---
+
+```{r}
+#| include: false
+#| label: setup
+
+library(tidymodels)
+library(readr)
+```
+
+## 准备数据
+
+```{r}
+
+col_fct_ft <- col_factor(c('f', 't'))
+col_types <- cols(
+  age = 'i',
+  sex = col_factor(c('F', 'M')),
+  on_thyroxine = col_fct_ft,
+  query_on_thyroxine = col_fct_ft,
+  on_antithyroid_medication =  col_fct_ft,
+  sick = col_fct_ft,
+  pregnant = col_fct_ft,
+  thyroid_surgery = col_fct_ft,
+  I131_treatment = col_fct_ft,
+  query_hypothyroid = col_fct_ft,
+  query_hyperthyroid = col_fct_ft,
+  lithium = col_fct_ft,
+  goitre = col_fct_ft,
+  tumor = col_fct_ft,
+  hypopituitary = col_fct_ft,
+  psych = col_fct_ft,
+  TSH_measured = col_fct_ft,
+  TSH = col_number(),
+  T3_measured = col_fct_ft,
+  T3 = col_number(),
+  TT4_measured = col_fct_ft,
+  TT4 = col_number(),
+  T4U_measured = col_fct_ft,
+  T4U = col_number(),
+  FTI_measured = col_fct_ft,
+  FTI = col_number(),
+  TBG_measured = col_fct_ft,
+  TBG = col_number(),
+  referral_source = col_factor(c('SVHC', 'other', 'SVI', 'STMW', 'SVHD')),
+  Class = col_factor(c('primary_hypothyroid', 'compensated_hypothyroid', 'secondary_hypothyroid', 'negative'))
+)
+
+col_names <- col_types %>% pluck('cols') %>% names()
+
+df <- read_csv(
+  'data/dataset_57_hypothyroid.arff',
+  skip = 112,
+  comment = '%',
+  col_names = col_names,
+  col_types = col_types,
+  na = '?'
+)
+
+stopifnot(nrow(problems(df)) == 0)
+```
+
+我们将使用医学应用程序来说明 See5——挖掘悉尼加文医学研究所的甲状腺检测数据库，以构建甲状腺功能减退症的诊断规则。每个病例都涉及一次转诊，并包含有关转诊来源、要求的化验、患者数据和转诊医生评论的信息。以下是三个例子：
+
+```{r}
+library(gt)
+
+df %>%
+  head(3) %>% 
+  gt() %>% 
+  tab_source_note(
+    md('From https://www.openml.org/search?type=data&sort=runs&id=57&status=active'))
+```
+
+这正是 See5 的设计目的。每个案例都属于少数相互排斥的类别之一（negative, primary, secondary, compensated）。提供了*可能*与其类相关的每个案例的属性，尽管某些案例可能具有未知或不适用的某些属性值。本示例中有 24 个属性，但 See5 可以处理任意数量的属性。
+
+See5 的工作是找到如何根据其他属性的值来预测案例的类别。 See5 通过构建一个进行此预测的*分类器*来实现此目的。正如我们将看到的，See5 可以构建以*决策树*或*规则*集表示的分类器。
+
+## 建模
+
+### Decision tree
+
+```{r}
+set.seed(123)
+df_split <- initial_split(df)
+df_training <- training(df_split)
+df_testing <- testing(df_split)
+
+c50_mod <- decision_tree() %>% 
+  set_engine('C5.0') %>% 
+  set_mode('classification')
+
+df_wf <- workflow() %>% 
+  add_model(c50_mod) %>% 
+  add_formula(Class ~ .)
+
+df_fit <- df_wf %>% 
+  fit(data = df_training)
+
+df_c50_fit <- df_fit %>% 
+  extract_fit_engine() 
+
+df_c50_fit %>% 
+  summary()
+```
+
+这棵树使用案例的属性值来将它映射到一个class的叶子*leaf*上，每棵树的叶子后面都跟着一个神秘的（n）或（n/m）。例如，决策树的最后一片叶子compensated_hypothyroid（142.2/1.7），其中n为142.2，m（如果出现）为1.7。n的值是数据中被映射到这片叶子的案例数量，m（如果出现）是被这片叶子错误分类的案例数量。（由于树中某个属性值未知，See5会将案例分成几部分，并将一部分发送到每个分支上，从而导致案例数量不是整数。）
+
+### Evaluation
+
+决策树结果为
+
+```         
+        Decision Tree   
+      ----------------  
+      Size      Errors  
+
+        11    8( 0.3%)   <<
+```
+
+Size指的是树上非空叶子的数量，Errors则表示分类错误的案例数量和百分比。这棵树有 11 个叶子，错误分类了 2772 个给定案例中的 8 个，错误率为 0.3%。这似乎与叶子上记录的错误数相矛盾 -- 上面提到的叶子显示有 24.8 个错误！这种矛盾的产生是因为由于未知属性值导致的案例分割部分可能会被错误分类，但是当所有部分的投票被汇总时，仍然可以选择正确的类别。
+
+当只有二十个或二十个以下的类时，在一个混淆矩阵中对训练案例的表现进行进一步分析，该矩阵将显示出发生的错误类型。
+
+```         
+       (a)   (b)   (c)   (d)    <-classified as
+      ----  ----  ----  ----
+        72     1                (a): class primary_hypothyroid
+             144                (b): class compensated_hypothyroid
+                           2    (c): class secondary_hypothyroid
+         3     2        2605    (d): class negative
+```
+
+在这个例子中，决策树错分了：
+
+-   1个primary_hypothyroid被错误分类成了compensated_hypothyroid
+-   2个secondary_hypothyroid被错误分类成了negative
+-   3个negative被错误分类成了primary_hypothyroid，2个negative被错误分类成了compensated_hypothyroid
+
+### 规则集
+
+决策树有时可能很难理解。See5 的一个重要特性是它能够生成称为*规则集*的分类器，这些分类器由（相对）简单的 if-then 规则的无序集合组成。
+
+```{r}
+library(rules)
+
+c5_rule_mod <- C5_rules()
+
+df_c50_rule_fit <- df_wf %>% 
+  update_model(c5_rule_mod) %>% 
+  fit(data = df_training)
+
+df_c50_rule_fit %>% 
+  extract_fit_engine() %>% 
+  summary()
+```
+
+每条规则都包含：
+
+-   规则编号 -- 这是非常随意的，仅用于标识规则。
+
+-   汇总规则性能的统计信息 `（n， lift x）` 或 `（n/m， lift x）`。与叶子类似，n 是规则涵盖的训练案例数，如果出现，m 表示其中有多少个不属于规则预测的类。规则的准确度(置信度)由拉普拉斯比率(Laplace ratio)$(n-m+1)/(n+2)$ 估计。提升度`lift x` 是将规则的估计准确度除以训练集中预测类的相对频率的结果。
+
+-   规则必须满足一个或多个条件
+
+-   规则预测的类
+
+-   介于 0 和 1 之间的值，指示进行此预测的置信度。（注意：下面描述的*boosting*选项采用对训练案例进行人工加权;如果使用它，置信度可能无法反映规则的真实准确性。)
+
+当使用这样的规则集进行分类时，可能会出现几条规则都适用的情况（即所有条件都满足）。如果适用的规则预测了不同的类别，那么就会出现隐含的冲突，可以通过多种方式解决：例如，我们可以相信置信度最高的规则，或者我们可以尝试将规则的预测汇总，从而得出判决。See5 采用的是后一种策略--每条适用的规则都会对其预测的类别进行投票，投票权重等于其置信度值，然后将票数相加，选出总票数最高的类别作为最终预测结果。此外，还有一个默认类（此处为负类），在所有规则都不适用时使用。
+
+规则集通常比树更容易理解，因为每条规则都描述了与类相关的特定上下文。此外，从树生成的规则集通常比树的叶子数量少，这也是可理解性的另一个优点。
+
+规则集分类器的另一个优点是，它们可以成为比决策树更准确的预测因子 - 这里没有具体说明这一点，因为规则集在测试样例上的错误率仅为 0.5%。但是，对于非常庞大的数据集，使用“规则集”选项生成规则可能需要相当长的计算机时间。
+
+对于特定的应用，决策树和规则集所显示的属性使用情况可能有些不同。在决策树中，根部的属性总是会被使用（前提是其值已知），而在决策树的下层，属性的使用频率较低。对于规则集来说，如果至少有一条适用于案例的规则的条件引用了某个属性，那么该属性就会被用来对案例进行分类；属性在规则集中出现的顺序并不重要。
+
+提升度
+
+> 提升度（Lift）是数据挖掘和市场营销中的一个重要指标，用于评估某种特定行为或事件在某个子群体中的发生概率相对于在整个群体中的发生概率的提升程度。简单来说，提升度衡量的是某种行为在特定条件下的发生频率与在无条件下的发生频率的比值。
+>
+> $$ \text{提升度} = \frac{P(A \cap B)}{P(A) \cdot P(B)} $$
+>
+> -   如果提升度 \> 1，表示事件A和事件B之间存在正相关关系，即在事件B发生的情况下，事件A发生的可能性比随机情况下更高。
+> -   如果提升度 = 1，表示事件A和事件B之间没有显著的相关关系，即在事件B发生的情况下，事件A发生的可能性与随机情况下相同。
+> -   如果提升度 \< 1，表示事件A和事件B之间存在负相关关系，即在事件B发生的情况下，事件A发生的可能性比随机情况下更低。
+>
+> 在C5.0规则集中，**提升度（Lift）** 是一个重要的指标，用于衡量某条规则的有效性。具体来说，提升度表示在给定条件下，目标类的出现概率相对于其在整个数据集中出现概率的提升程度。
+>
+> 提升度的计算公式为： $$\text{提升度} = \frac{P(\text{目标类} | \text{条件})}{P(\text{目标类})} $$
+>
+> -   $P(\text{目标类} | \text{条件})$是在满足规则条件的情况下，目标类出现的概率。
+> -   $P(\text{目标类})$是目标类在整个数据集中出现的概率。
+>
+> 提升度越高，表示在满足该规则条件的情况下，目标类的出现概率相对于其在整个数据集中出现概率的提升程度越大，从而说明该规则在识别目标类方面的有效性越强。
+
+以Rule 1举例
+
+```         
+Rule 1: (45, lift 37.9)
+    TSH > 30.5
+    TT4 <= 48
+    thyroid_surgery = f
+    ->  class primary_hypothyroid  [0.979]
+```
+
+其置信度为
+
+$$
+P(primary\_hypothyroid|Rule1)=(n-m+1)/(n+2)=(45-0+1)/(45+2)=46/47=0.979
+$$
+
+而Class的分布如下：
+
+```{r}
+df_training %>% 
+  count(Class) %>% 
+  mutate(pct = n / sum(n))
+```
+
+所以其提升度为：
+
+$$
+lift = P(primary\_hypothyroid|Rule1)/P(primary\_hypothyroid) = 0.979/0.0258=37.9
+$$
+
+Rule 1和Rule 2的置信度和提升度都很高，说明对于识别primary_hypothyroid很有效。
+
+Rule 3的提升度高，但置信度只有0.522，这是因为compensated_hypothyroid占全体的比例为0.05，即使这个规则提升了10倍，其置信度也才0.5。
+
+Rule 4到Rule 8的提升度低，但置信度高，是因为类别negative占全体的比例为0.92，所以仅提升1.1倍，其置信度也会很高。
+
+|              | 提升度高         | 提升度低         |
+|--------------|------------------|------------------|
+| **置信度高** | 有效规则         | 类别本身占比极高 |
+| **置信度低** | 类别本身占比极低 | 无效规则         |

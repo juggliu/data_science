@@ -1,0 +1,227 @@
+---
+title: "19丨决策树（下）：泰坦尼克乘客生存预测(使用R)"
+format: html
+---
+
+在前面的两篇文章中，我给你讲了决策树算法。决策树算法是经常使用的数据挖掘算法，这是因为决策树就像一个人脑中的决策模型一样，呈现出来非常直观。基于决策树还诞生了很多数据挖掘算法，比如随机森林（Random forest）。
+
+今天我来带你用决策树进行项目的实战。
+
+决策树分类的应用场景非常广泛，在各行各业都有应用，比如在金融行业可以用决策树做贷款风险评估，医疗行业可以用决策树生成辅助诊断，电商行业可以用决策树对销售额进行预测等。
+
+在了解决策树的原理后，今天我们用工具解决一个实际的问题：泰坦尼克号乘客的生存预测。
+
+## **Titanic 乘客生存预测**
+
+### **问题描述**
+
+泰坦尼克海难是著名的十大灾难之一，究竟多少人遇难，各方统计的结果不一。现在我们在R包**titanic**可以得到部分的数据。
+
+在训练集中，包括了以下字段，它们具体为：
+
+-   PassengerId 乘客编号
+
+-   Survived 是否幸存
+
+-   Pclass 船票舱位
+
+-   Name 乘客姓名
+
+-   Sex 乘客性别
+
+-   SibSp 船上兄弟姐妹/配偶人数
+
+-   Parch 船上父母/子女人数
+
+-   Ticket 船票号码
+
+-   Fare 船票价格
+
+-   Cabin 船舱
+
+-   Embarked 登陆港口
+
+### **生存预测的关键流程**
+
+我们要对训练集中乘客的生存进行预测，这个过程可以划分为两个重要的阶段：
+
+![](images/clipboard-14712493.png)
+
+1.  **准备阶段**：我们首先需要对训练集、测试集的数据进行探索，分析数据质量，并对数据进行清洗，然后通过特征选择对数据进行降维，方便后续分类运算；
+
+2.  **分类阶段**：首先通过训练集的特征矩阵、分类结果得到决策树分类器，然后将分类器应用于测试集。然后我们对决策树分类器的准确性进行分析，并对决策树模型进行可视化。
+
+下面，我分别对这些模块进行介绍。
+
+**模块 1：数据探索**
+
+数据探索这部分虽然对分类器没有实质作用，但是不可忽略。我们只有足够了解这些数据的特性，才能帮助我们做数据清洗、特征选择。
+
+```{r}
+library(titanic)
+library(tidyverse)
+library(gtsummary)
+library(dlookr)
+
+train_data <- titanic_train
+test_data <- titanic_test
+
+train_data %>% 
+  mutate(across(where(is.character), ~ fct_lump_min(.x, min = 5))) %>%
+  tbl_summary(missing_text = "NA")
+```
+
+**模块 2：数据清洗**
+
+```{r}
+train_data %>% 
+  summarise(across(everything(), ~ sum(nchar(.) == 0))) %>% 
+  pivot_longer(everything(), names_to = "var", values_to = "n") %>% 
+  filter(n > 0)
+```
+
+通过数据探索，我们发现Cabin和Cabin有空值，我们将其转换为缺失值NA
+
+```{r}
+replace_empty <- function(df) {
+  df %>% 
+    mutate(across(c(Cabin, Embarked), ~if_else(nchar(.) == 0, NA, .)))
+}
+
+train_data <- train_data %>% 
+  replace_empty()
+
+test_data <- test_data %>% 
+  replace_empty()
+```
+
+接下来查看缺失值的情况
+
+```{r}
+train_data %>% 
+  summarise(across(everything(), ~ sum(is.na(.)))) %>% 
+  pivot_longer(everything(), names_to = "var", values_to = "n") %>% 
+  filter(n > 0)
+```
+
+我们发现 Age、Embarked 和 Cabin 这三个字段的数据有所缺失。其中 Age 为年龄字段，是数值型，我们可以通过平均值进行补齐。
+
+具体实现的代码如下：
+
+```{r}
+replace_na_mean <- function(df) {
+  df %>% 
+    mutate(across(
+      c(Age),
+      ~replace_na(.x, mean(.x, na.rm = TRUE))
+      )) 
+}
+
+train_data <- train_data %>% 
+  replace_na_mean()
+test_data <- test_data %>% 
+  replace_na_mean()
+```
+
+Cabin 为船舱，有大量的缺失值。在训练集和测试集中的缺失率分别为 77% 和 78%，无法补齐；Embarked 为登陆港口，有少量的缺失值，我们可以把缺失值补齐。
+
+首先观察下 Embarked 字段的取值：
+
+```{r}
+train_data %>% 
+  select(Embarked) %>% 
+  tbl_summary()
+```
+
+我们发现一共就 3 个登陆港口，其中 S 港口人数最多，占到了 72%，因此我们将其余缺失的 Embarked 数值均设置为 S：
+
+```{r}
+train_data <- train_data %>% 
+  replace_na(list(Embarked = 'S'))
+test_data <- test_data %>% 
+  replace_na(list(Embarked = 'S'))
+```
+
+**模块 3：特征选择**
+
+特征选择是分类器的关键。特征选择不同，得到的分类器也不同。那么我们该选择哪些特征做生存的预测呢？
+
+通过数据探索我们发现，PassengerId 为乘客编号，对分类没有作用，可以放弃；Name 为乘客姓名，对分类没有作用，可以放弃；Cabin 字段缺失值太多，可以放弃；Ticket 字段为船票号码，杂乱无章且无规律，可以放弃。其余的字段包括：Pclass、Sex、Age、SibSp、Parch 、Fare、Embarked，这些属性分别表示了乘客的船票等级、性别、年龄、亲戚数量以及船票价格，可能会和乘客的生存预测分类有关系。
+
+```{r}
+train_data %>% 
+  select(Pclass, Sex, Age, SibSp, Parch, Fare, Embarked) %>% 
+  head()
+```
+
+检查这些字段，发现Pclass目前类型为数值型，需要将其转换为因子型。
+
+```{r}
+train_data <- train_data %>% 
+  mutate(Survived = as.logical(Survived)) %>% 
+  mutate(Pclass = as_factor(Pclass))
+
+test_data <- test_data %>% 
+  mutate(Pclass = as_factor(Pclass))
+```
+
+创建决策树，将Survived作为输出变量，使用训练集进行训练
+
+```{r}
+library(tidymodels)
+
+# 创建决策树回归模式
+dec_tree <- decision_tree() %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+  #set_mode("regression")
+
+# 训练
+tree_fit <- dec_tree %>% 
+  fit(
+    Survived ~ Pclass + Sex + Age + SibSp + Parch + Fare + Embarked,
+    data = train_data %>% mutate(Survived = as_factor(Survived)))
+```
+
+```{r}
+library(rpart.plot)
+
+# prp(
+#   tree_fit$fit,
+#   faclen = 0,
+#   fallen.leaves = TRUE)
+# rpart.plot(
+#   tree_fit$fit,
+#   type = 4,
+#   extra = 101,
+#   under = TRUE,
+#   cex = 0.8,
+#   box.palette = "auto")
+
+rpart.plot(
+  tree_fit$fit,
+  type = 4,
+  extra = 106)
+```
+
+从根节点开始看存活率为0.38，其中男性存活率为0.19，女性为0.74
+
+```{r}
+library(vip)
+
+# Create a variable importance plot
+var_importance <- vip::vip(tree_fit, num_features = 10)
+print(var_importance)
+```
+
+```{r}
+train_data %>% 
+  select(Survived, Sex, Pclass, Fare, SibSp, Age) %>%  
+  tbl_strata2(
+    strata = Survived,
+    .tbl_fun = 
+      ~ tbl_summary(
+        .,
+        by = Sex
+      ))
+```
